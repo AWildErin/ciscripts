@@ -1,0 +1,47 @@
+stages:
+  - build
+
+build-step:
+  tags:
+    - windows
+    - unreal
+    - erin
+
+  image: awilderin/unreal:latest
+  stage: build
+
+  variables:
+    IsBuildMachine: 1
+    # Latest changelist on 5.3. Please update if you merge changes from upstream.
+    uebp_CL: 32480491
+    uebp_CodeCL: 32480491    
+
+    # Sccache Stuff
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: 1
+    GIT_SUBMODULE_FORCE_HTTPS : "true"
+    SCCACHE_IDLE_TIMEOUT: 0 # It's running in a container so the server will be killed automatically.
+    AWS_ACCESS_KEY_ID: $R2_ACCESS_KEY_ID
+    AWS_SECRET_ACCESS_KEY: $R2_SECRET_ACCESS_KEY
+    SCCACHE_ENDPOINT: $R2_ENDPOINT
+    SCCACHE_BUCKET: awe-sccache-ue5
+    SCCACHE_REGION: auto
+    SCCACHE_ERROR_LOG: "$CI_PROJECT_DIR/Engine/SccacheErrLog.log"
+    #SCCACHE_LOG: debug
+    #SCCACHE_RECACHE: true
+    # Update accordingly!
+    SCCACHE_S3_KEY_PREFIX: "windows/ue5/5.3/dev"
+
+  artifacts:
+    when: on_failure
+    expire_in: "1 week"
+    paths:
+      - "Engine/Programs/AutomationTool/Saved/Logs/*.txt"
+
+  script:
+    - $env:PATH = "$env:PATH;$env:CI_PROJECT_DIR/Engine/Binaries/ThirdParty/glab"
+    - pip install -r ./Engine/Scripts/CI/ciscripts/requirements.txt
+    - ./Engine/Binaries/DotNET/GitDependencies/win-x64/GitDependencies.exe --force
+    - ./Engine/Binaries/ThirdParty/Sccache/sccache.exe --start-server
+    - py ./Engine/Scripts/CI/InstalledEngineBuild.py
+    - ./Engine/Binaries/ThirdParty/Sccache/sccache.exe --show-stats

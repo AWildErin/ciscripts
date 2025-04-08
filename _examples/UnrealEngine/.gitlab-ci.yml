@@ -1,0 +1,14 @@
+default:
+  interruptible: true
+
+stages:
+  - trigger
+
+trigger-installedbuild:
+  stage: trigger
+  trigger:
+    include: ".gitlab/ci/.installedbuild.gitlab-ci.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "InstalledBuild"

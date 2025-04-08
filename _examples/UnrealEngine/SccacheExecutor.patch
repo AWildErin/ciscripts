@@ -1,0 +1,955 @@
+From 94ae90e5583cc1bbd18bbef007da926db05bf3f1 Mon Sep 17 00:00:00 2001
+From: AWildErin <sharpian126@gmail.com>
+Date: Sat, 4 Jan 2025 17:07:20 +0000
+Subject: [PATCH] Implement sccache support
+
+---
+ .gitignore                                    |   3 +
+ .gitlab-ci.yml                                |  28 ++-
+ .../Binaries/ThirdParty/Sccache/sccache.exe   |   3 +
+ .../Binaries/ThirdParty/Sccache/sccache.tps   |  12 ++
+ Engine/Build/InstalledEngineBuild.xml         | 199 +++++++++---------
+ .../Source/SQLiteCore/SQLiteCore.Build.cs     |   4 +
+ Engine/Scripts/Programmer/BuildSccache.ps1    |  49 +++++
+ .../Programmer/deprecated_GetSccache.ps1      |  59 ++++++
+ .../AutomationUtils/UnrealBuild.cs            |  14 +-
+ .../BuildGraph/Tasks/CompileTask.cs           |  14 +-
+ .../Configuration/BuildConfiguration.cs       |   9 +
+ .../Executors/ParallelExecutor.cs             |   4 +-
+ .../UnrealBuildTool/Executors/Sccache.cs      | 160 ++++++++++++++
+ .../UnrealBuildTool/System/ActionGraph.cs     |   6 +
+ 14 files changed, 450 insertions(+), 114 deletions(-)
+ create mode 100644 Engine/Binaries/ThirdParty/Sccache/sccache.exe
+ create mode 100644 Engine/Binaries/ThirdParty/Sccache/sccache.tps
+ create mode 100644 Engine/Scripts/Programmer/BuildSccache.ps1
+ create mode 100644 Engine/Scripts/Programmer/deprecated_GetSccache.ps1
+ create mode 100644 Engine/Source/Programs/UnrealBuildTool/Executors/Sccache.cs
+
+diff --git a/.gitignore b/.gitignore
+index b0db4da0ad..dff785b626 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -300,4 +300,7 @@ Engine/Extras/ThirdPartyNotUE/SDKs/HostLinux/**
+ # Fork file
+ !.issuetracker
+ 
++# Allow our build of sccache
++!Engine/Binaries/ThirdParty/Sccache/*
++
+ # AWE_CHANGES_END
+\ No newline at end of file
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+index 61e6ebcc50..caaec2ca18 100644
+--- a/.gitlab-ci.yml
++++ b/.gitlab-ci.yml
+@@ -19,34 +19,42 @@ build-win64:
+     uebp_CL: 32480491
+     uebp_CodeCL: 32480491    
+ 
+-  cache:
+-    key: $CI_COMMIT_REF_NAME
+-    # We're fine with this, we're only storing compile products meaning if errors occure it'll just recompile those files
+-    when: always
+-    paths:
+-      - "Engine/**/Intermediate/*"
++    # Sccache Stuff
++    SCCACHE_IDLE_TIMEOUT: 0 # It's running in a container so the server will be killed automatically.
++    AWS_ACCESS_KEY_ID: $R2_ACCESS_KEY_ID
++    AWS_SECRET_ACCESS_KEY: $R2_SECRET_ACCESS_KEY
++    SCCACHE_ENDPOINT: $R2_ENDPOINT
++    SCCACHE_BUCKET: awe-sccache-ue5
++    SCCACHE_REGION: auto
++    #SCCACHE_ERROR_LOG: "$CI_PROJECT_DIR/Engine/SccacheErrLog.log"
++    #SCCACHE_LOG: debug
++    #SCCACHE_RECACHE: true
++    # Update accordingly!
++    SCCACHE_S3_KEY_PREFIX: "windows/ue5/5.3/dev"
+ 
+   artifacts:
+     when: on_failure
++    expire_in: "1 week"
+     paths:
+       - "Engine/Programs/AutomationTool/Saved/Logs/*.txt"
++      - "Engine/SccacheErrLog.log"
+ 
+   script:
+-    - if (Test-Path "Engine/Programs/AutomationTools/Saved/Logs") { Remove-Item -Recurse -Force "Engine/Programs/AutomationTools/Saved/Logs" }
+-    - if (Test-Path "LocalBuilds/") { Remove-Item -Recurse -Force "LocalBuilds/" }
+     - ./Engine/Binaries/DotNET/GitDependencies/win-x64/GitDependencies.exe --force
+     - ./Engine/Build/BatchFiles/RunUAT.bat BuildGraph 
+       -script="Engine/Build/InstalledEngineBuild.xml" 
+-      -target="Make Installed Build Win64"
++      -target="Archive Installed Build Win64"
+       -nosign 
++      -set:UseSccache=true   
+       -set:GameConfigurations="Development;Test;Shipping" 
+       -set:WithFullDebugInfo=false
+       -set:WithWin64=true
+       -set:WithAndroid=false
+-      -set:WithDDC=false
+       -set:WithLinux=false
+       -set:WithLinuxArm64=false
+       -set:WithIOS=false
+       -set:WithTVOS=false
+       -set:WithMac=false 
++      -set:WithDDC=false
+       #-clean # We don't use clean as we have build caching and this will remove those
++    - ./Engine/Binaries/ThirdParty/Sccache/sccache.exe --show-stats
+\ No newline at end of file
+diff --git a/Engine/Binaries/ThirdParty/Sccache/sccache.exe b/Engine/Binaries/ThirdParty/Sccache/sccache.exe
+new file mode 100644
+index 0000000000..a8d5ca490e
+--- /dev/null
++++ b/Engine/Binaries/ThirdParty/Sccache/sccache.exe
+@@ -0,0 +1,3 @@
++version https://git-lfs.github.com/spec/v1
++oid sha256:6d0f7bfeea9b9ab0b2cae521ae953af8f969dc790ce644575dd00cddecfcded3
++size 19664384
+diff --git a/Engine/Binaries/ThirdParty/Sccache/sccache.tps b/Engine/Binaries/ThirdParty/Sccache/sccache.tps
+new file mode 100644
+index 0000000000..87dae32798
+--- /dev/null
++++ b/Engine/Binaries/ThirdParty/Sccache/sccache.tps
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="utf-8"?>
++<TpsData xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
++  <Name>sccache (#14b6bcc45e30c5967c5596575b16a10603fbcc04)</Name>
++  <Location>Engine/Binaries/ThirdParty/Sccache/sccache.exe</Location>
++  <Function>Used to handle caching for CI/CD builds.</Function>
++  <RedistributeTo>
++    <EndUserGroup>Licensees</EndUserGroup>
++    <EndUserGroup>Git</EndUserGroup>
++    <EndUserGroup>P4</EndUserGroup>
++  </RedistributeTo>
++  <LicenseFolder>None</LicenseFolder>
++</TpsData>
+\ No newline at end of file
+diff --git a/Engine/Build/InstalledEngineBuild.xml b/Engine/Build/InstalledEngineBuild.xml
+index e8c8d625df..7ccf015ff1 100644
+--- a/Engine/Build/InstalledEngineBuild.xml
++++ b/Engine/Build/InstalledEngineBuild.xml
+@@ -82,6 +82,9 @@
+ 	<Option	Name="AllowParallelExecutor" Restrict="true|false" DefaultValue="false" Description="Allow the use of UAT's ParallelExecutor when compiling"/>
+ 	<Property Name="bAllowParallelExecutor" Value="$(AllowParallelExecutor)" />
+ 
++	<Option	Name="UseSccache" Restrict="true|false" DefaultValue="false" Description="Allow the use of sccache when compiling"/>
++	<Property Name="bUseSccache" Value="$(UseSccache)" />
++
+ 	<!-- The local output directory -->
+ 	<Property Name="LocalInstalledDir" Value="$(BuiltDirectory)/Windows"/>
+ 	<Property Name="LocalInstalledDirMac" Value="$(BuiltDirectory)/Mac"/>
+@@ -159,8 +162,8 @@
+ 			<SetVersion Change="$(Change)" Branch="$(EscapedBranch)" If="$(IsBuildMachine)"/>
+ 		</Node>
+ 		<Node Name="Compile UnrealEditor Win64" Requires="Update Version Files" Produces="#UnrealEditor Win64;#UnrealEditor Win64 Unstripped;#UnrealEditor Win64 Stripped;#UnrealEditor Win64 Unsigned;#UnrealEditor Win64 Signed;#UnrealEditor Win64 WithExceptions">
+-			<Compile Target="UnrealEditor" Platform="Win64" Configuration="DebugGame" Tag="#UnrealEditor Win64" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
+-			<Compile Target="UnrealEditor" Platform="Win64" Configuration="Development" Tag="#UnrealEditor Win64" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
++			<Compile Target="UnrealEditor" Platform="Win64" Configuration="DebugGame" Tag="#UnrealEditor Win64" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
++			<Compile Target="UnrealEditor" Platform="Win64" Configuration="Development" Tag="#UnrealEditor Win64" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
+ 
+ 			<Do If="$(EmbedSrcSrvInfo)">
+ 				<!-- Embed source info into the PDB files. Should be done from this machine to ensure that paths are correct. -->
+@@ -203,8 +206,8 @@
+ 	<Agent Name="Editor Mac" Type="Mac_Licensee">
+ 		<Node Name="Compile UnrealEditor Mac" Requires="Update Version Files" Produces="#UnrealEditor Mac;#UnrealEditor Mac Unstripped;#UnrealEditor Mac Stripped;#UnrealEditor Mac Unsigned;#UnrealEditor Mac Signed;#UnrealEditor Mac WithExceptions">
+ 			<Property Name="AllModulesArg" Value="-allmodules"/>
+-			<Compile Target="UnrealEditor" Platform="Mac" Configuration="DebugGame" Tag="#UnrealEditor Mac" Arguments="-precompile -EnableDSYM $(AllModulesArg) $(CrashReporterCompileArgs) $(MacArchitectureArg)"/>
+-			<Compile Target="UnrealEditor" Platform="Mac" Configuration="Development" Tag="#UnrealEditor Mac" Arguments="-precompile -EnableDSYM $(AllModulesArg) $(CrashReporterCompileArgs) $(MacArchitectureArg)"/>
++			<Compile Target="UnrealEditor" Platform="Mac" Configuration="DebugGame" Tag="#UnrealEditor Mac" UseSccache="$(bUseSccache)" Arguments="-precompile -EnableDSYM $(AllModulesArg) $(CrashReporterCompileArgs) $(MacArchitectureArg)"/>
++			<Compile Target="UnrealEditor" Platform="Mac" Configuration="Development" Tag="#UnrealEditor Mac" UseSccache="$(bUseSccache)" Arguments="-precompile -EnableDSYM $(AllModulesArg) $(CrashReporterCompileArgs) $(MacArchitectureArg)"/>
+ 
+ 			<Property Name="UnrealEditorExceptions" Value=""/>
+ 			<Property Name="UnrealEditorExceptions" Value="$(PluginsExceptions)" If="$(CompileDatasmithPlugins)"/>
+@@ -235,8 +238,8 @@
+ 	<!-- Base editor and tools for compile on Linux -->
+ 	<Agent Name="Editor Linux" Type="Linux_Licensee">
+ 		<Node Name="Compile UnrealEditor Linux" Requires="Update Version Files" Produces="#UnrealEditor Linux;#UnrealEditor Linux Unstripped;#UnrealEditor Linux Stripped;#UnrealEditor Linux WithExceptions">
+-			<Compile Target="UnrealEditor" Platform="Linux" Configuration="DebugGame" Tag="#UnrealEditor Linux" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
+-			<Compile Target="UnrealEditor" Platform="Linux" Configuration="Development" Tag="#UnrealEditor Linux" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
++			<Compile Target="UnrealEditor" Platform="Linux" Configuration="DebugGame" Tag="#UnrealEditor Linux" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
++			<Compile Target="UnrealEditor" Platform="Linux" Configuration="Development" Tag="#UnrealEditor Linux" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules $(CrashReporterCompileArgs)"/>
+ 
+ 			<Tag Files="#UnrealEditor Linux" Filter="$(LinuxStripFilter)" With="#UnrealEditor Linux Unstripped"/>
+ 			<Tag Files="#UnrealEditor Linux" Except="$(PluginsExceptions)" With="#UnrealEditor Linux WithExceptions"/>
+@@ -261,8 +264,8 @@
+ 		<ForEach Name="Target" Values="$(OptionalClientTarget);$(OptionalServerTarget)">
+ 			<Node Name="Compile $(Target) Win64" Requires="Update Version Files" Produces="#$(Target) Win64">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="Win64" Configuration="$(Configuration)" Tag="#$(Target) Win64" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
+-					<Compile Target="$(Target)" Platform="Win64" Configuration="$(Configuration)" Tag="#$(Target) Win64" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="Win64" Configuration="$(Configuration)" Tag="#$(Target) Win64" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
++					<Compile Target="$(Target)" Platform="Win64" Configuration="$(Configuration)" Tag="#$(Target) Win64" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
+ 					<Property Name="OptionalTargetTags" Value="$(OptionalTargetTags);#$(Target) Win64"/>
+ 				</ForEach>
+ 			</Node>
+@@ -272,8 +275,8 @@
+ 				<Tag Files="$(Tag)" With="#UnrealGame Win64"/>
+ 			</ForEach>
+ 			<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-				<Compile Target="UnrealGame" Platform="Win64" Configuration="$(Configuration)" Tag="#UnrealGame Win64" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
+-				<Compile Target="UnrealGame" Platform="Win64" Configuration="$(Configuration)" Tag="#UnrealGame Win64" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
++				<Compile Target="UnrealGame" Platform="Win64" Configuration="$(Configuration)" Tag="#UnrealGame Win64" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
++				<Compile Target="UnrealGame" Platform="Win64" Configuration="$(Configuration)" Tag="#UnrealGame Win64" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
+ 			</ForEach>
+ 
+ 			<Do If="$(EmbedSrcSrvInfo)">
+@@ -309,8 +312,8 @@
+ 		<Node Name="Compile UnrealGame Linux" Requires="Update Version Files" Produces="#UnrealGame Linux;#UnrealGame Linux Unstripped;#UnrealGame Linux Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget);$(OptionalServerTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame Linux" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
+-					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame Linux" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame Linux" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
++					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame Linux" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -324,8 +327,8 @@
+ 		<Node Name="Compile UnrealGame LinuxNative" Requires="Update Version Files" Produces="#UnrealGame LinuxNative;#UnrealGame LinuxNative Unstripped;#UnrealGame LinuxNative Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget);$(OptionalServerTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
+-					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
++					<Compile Target="$(Target)" Platform="Linux" Configuration="$(Configuration)" Tag="#UnrealGame LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -339,8 +342,8 @@
+ 		<Node Name="Compile UnrealGame LinuxArm64" Requires="Update Version Files" Produces="#UnrealGame LinuxArm64;#UnrealGame LinuxArm64 Unstripped;#UnrealGame LinuxArm64 Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget);$(OptionalServerTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
+-					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
++					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -354,8 +357,8 @@
+ 		<Node Name="Compile UnrealGame LinuxArm64 LinuxNative" Requires="Update Version Files" Produces="#UnrealGame LinuxArm64 LinuxNative;#UnrealGame LinuxArm64 LinuxNative Unstripped;#UnrealGame LinuxArm64 LinuxNative Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget);$(OptionalServerTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64 LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
+-					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64 LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64 LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArg)"/>
++					<Compile Target="$(Target)" Platform="LinuxArm64" Configuration="$(Configuration)" Tag="#UnrealGame LinuxArm64 LinuxNative" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArg)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -369,8 +372,8 @@
+ 		<Node Name="Compile UnrealGame Android" Requires="Update Version Files" Produces="#UnrealGame Android;#UnrealGame Android Unstripped;#UnrealGame Android Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="Android" Configuration="$(Configuration)" Tag="#UnrealGame Android" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink -architectures=$(AndroidArchitectures) $(TargetDebugInfoArg)"/>
+-					<Compile Target="$(Target)" Platform="Android" Configuration="$(Configuration)" Tag="#UnrealGame Android" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -architectures=$(AndroidArchitectures) $(TargetDebugInfoArg)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="Android" Configuration="$(Configuration)" Tag="#UnrealGame Android" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink -architectures=$(AndroidArchitectures) $(TargetDebugInfoArg)"/>
++					<Compile Target="$(Target)" Platform="Android" Configuration="$(Configuration)" Tag="#UnrealGame Android" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -architectures=$(AndroidArchitectures) $(TargetDebugInfoArg)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -388,8 +391,8 @@
+ 		<ForEach Name="Target" Values="$(OptionalClientTarget);$(OptionalServerTarget)">
+ 			<Node Name="Compile $(Target) Mac" Requires="Update Version Files" Produces="#$(Target) Mac">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="Mac" Configuration="$(Configuration)" Tag="#$(Target) Mac" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
+-					<Compile Target="$(Target)" Platform="Mac" Configuration="$(Configuration)" Tag="#$(Target) Mac" Arguments="-precompile $(TargetDebugInfoArgMac)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="Mac" Configuration="$(Configuration)" Tag="#$(Target) Mac" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
++					<Compile Target="$(Target)" Platform="Mac" Configuration="$(Configuration)" Tag="#$(Target) Mac" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArgMac)" Clean="false"/>
+ 					<Property Name="OptionalTargetTags" Value="$(OptionalTargetTags);#$(Target) Mac"/>
+ 				</ForEach>
+ 			</Node>
+@@ -400,8 +403,8 @@
+ 				<Tag Files="$(Tag)" With="#UnrealGame Mac"/>
+ 			</ForEach>
+ 			<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-				<Compile Target="UnrealGame" Platform="Mac" Configuration="$(Configuration)" Tag="#UnrealGame Mac" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
+-				<Compile Target="UnrealGame" Platform="Mac" Configuration="$(Configuration)" Tag="#UnrealGame Mac" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile $(TargetDebugInfoArgMac)" Clean="false"/>
++				<Compile Target="UnrealGame" Platform="Mac" Configuration="$(Configuration)" Tag="#UnrealGame Mac" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
++				<Compile Target="UnrealGame" Platform="Mac" Configuration="$(Configuration)" Tag="#UnrealGame Mac" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile $(TargetDebugInfoArgMac)" Clean="false"/>
+ 			</ForEach>
+ 
+ 			<Tag Files="#UnrealGame Mac" Filter="$(MacStripFilter)" With="#UnrealGame Mac Unstripped"/>
+@@ -420,8 +423,8 @@
+ 		<Node Name="Compile UnrealGame IOS" Requires="Update Version Files" Produces="#UnrealGame IOS;#UnrealGame IOS Unstripped;#UnrealGame IOS Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="IOS" Configuration="$(Configuration)" Tag="#UnrealGame IOS" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
+-					<Compile Target="$(Target)" Platform="IOS" Configuration="$(Configuration)" Tag="#UnrealGame IOS" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -createstub $(TargetDebugInfoArgMac)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="IOS" Configuration="$(Configuration)" Tag="#UnrealGame IOS" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
++					<Compile Target="$(Target)" Platform="IOS" Configuration="$(Configuration)" Tag="#UnrealGame IOS" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -createstub $(TargetDebugInfoArgMac)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -435,8 +438,8 @@
+ 		<Node Name="Compile UnrealGame TVOS" Requires="Update Version Files" Produces="#UnrealGame TVOS;#UnrealGame TVOS Unstripped;#UnrealGame TVOS Stripped">
+ 			<ForEach Name="Target" Values="UnrealGame;$(OptionalClientTarget)">
+ 				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+-					<Compile Target="$(Target)" Platform="TVOS" Configuration="$(Configuration)" Tag="#UnrealGame TVOS" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
+-					<Compile Target="$(Target)" Platform="TVOS" Configuration="$(Configuration)" Tag="#UnrealGame TVOS" AllowParallelExecutor="$(bAllowParallelExecutor)" Arguments="-precompile -createstub $(TargetDebugInfoArgMac)" Clean="false"/>
++					<Compile Target="$(Target)" Platform="TVOS" Configuration="$(Configuration)" Tag="#UnrealGame TVOS" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -allmodules -nolink $(TargetDebugInfoArgMac)"/>
++					<Compile Target="$(Target)" Platform="TVOS" Configuration="$(Configuration)" Tag="#UnrealGame TVOS" AllowParallelExecutor="$(bAllowParallelExecutor)" UseSccache="$(bUseSccache)" Arguments="-precompile -createstub $(TargetDebugInfoArgMac)" Clean="false"/>
+ 				</ForEach>
+ 			</ForEach>
+ 
+@@ -448,9 +451,9 @@
+ 
+ 	<Agent Name="NotForLicensee Tools Group Win64" Type="Win64">
+ 		<Node Name="Build NotForLicensee Tools Win64" Requires="Update Version Files" Produces="#NotForLicensee Build Tools Win64">
+-			<Compile Target="DatasmithCADWorker" Configuration="Development" Platform="Win64" Tag="#NotForLicensee Build Tools Win64"/>
++			<Compile Target="DatasmithCADWorker" Configuration="Development" Platform="Win64" Tag="#NotForLicensee Build Tools Win64" UseSccache="$(bUseSccache)"/>
+ 			<!-- Temporarily removing the compilation of DatasmithCADRuntime from the installed build
+-			<Compile Target="DatasmithCADRuntime" Configuration="Development" Platform="Win64" Tag="#NotForLicensee Build Tools Win64"/>
++			<Compile Target="DatasmithCADRuntime" Configuration="Development" Platform="Win64" Tag="#NotForLicensee Build Tools Win64" UseSccache="$(bUseSccache)"/>
+ 			-->
+ 		</Node>
+ 	</Agent>
+@@ -467,25 +470,25 @@
+ 
+ 	<Agent Name="Tools Group Win64" Type="Win64_Licensee">
+ 		<Node Name="Build Tools Win64" Requires="Update Version Files;#NotForLicensee Build Tools Win64" Produces="#Tools Win64 Complete">
+-			<Compile Target="CrashReportClient" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" Arguments="$(CrashReporterCompileArgs)"/>
+-			<Compile Target="CrashReportClientEditor" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" Arguments="$(CrashReporterCompileArgs)"/>
++			<Compile Target="CrashReportClient" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)" Arguments="$(CrashReporterCompileArgs)"/>
++			<Compile Target="CrashReportClientEditor" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)" Arguments="$(CrashReporterCompileArgs)"/>
+ 			<Tag Files="#NotForLicensee Build Tools Win64" With="#Build Tools Win64"/>
+-			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealInsights" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealFrontend" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealPak" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="LiveCodingConsole" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="BootstrapPackagedGame" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="SwitchboardListener" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="SwitchboardListenerHelper" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
+-			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64"/>
++			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealInsights" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealFrontend" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealPak" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="LiveCodingConsole" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="BootstrapPackagedGame" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="SwitchboardListener" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="SwitchboardListenerHelper" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Win64" Tag="#Build Tools Win64" UseSccache="$(bUseSccache)"/>
+ 
+ 			<Tag Files="Engine/Binaries/Win64/XGEControlWorker.exe" With="#Build Tools Win64"/>
+ 			<Tag Files="$(RootDir)/Engine/Saved/UnrealBuildTool/BuildConfiguration.Schema.xsd" With="#Build Tools Win64"/>
+@@ -548,21 +551,21 @@
+ 			<Sign Files="#Sign Binaries" If="'$(SignExecutables)' == true"/>
+ 		</Node>
+ 		<Node Name="Build Tools Linux" Requires="Update Version Files">
+-			<Compile Target="CrashReportClient" Platform="Linux" Configuration="Shipping" Tag="#Build Tools Linux" Arguments="$(CrashReporterCompileArgs)"/>
+-			<Compile Target="CrashReportClientEditor" Platform="Linux" Configuration="Shipping" Tag="#Build Tools Linux" Arguments="$(CrashReporterCompileArgs)"/>
+-			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealInsights" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealPak" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="SwitchboardListener" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="SwitchboardListenerHelper" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
+-			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux"/>
++			<Compile Target="CrashReportClient" Platform="Linux" Configuration="Shipping" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)" Arguments="$(CrashReporterCompileArgs)"/>
++			<Compile Target="CrashReportClientEditor" Platform="Linux" Configuration="Shipping" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)" Arguments="$(CrashReporterCompileArgs)"/>
++			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealInsights" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealPak" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="SwitchboardListener" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="SwitchboardListenerHelper" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Linux" Tag="#Build Tools Linux" UseSccache="$(bUseSccache)"/>
+ 		</Node>
+ 	</Agent>
+ 
+@@ -617,43 +620,43 @@
+ 		</Node>
+ 	
+ 		<Node Name="Build Tools Mac" Requires="Update Version Files">
+-			<Compile Target="CrashReportClient" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM $(CrashReporterCompileArgs)"/>
+-			<Compile Target="CrashReportClientEditor" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM $(CrashReporterCompileArgs)"/>
+-			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealInsights" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealFrontend" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealPak" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="DsymExporter" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealEditorServices" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealAtoS" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
+-			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" Arguments="-EnableDSYM"/>
++			<Compile Target="CrashReportClient" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM $(CrashReporterCompileArgs)"/>
++			<Compile Target="CrashReportClientEditor" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM $(CrashReporterCompileArgs)"/>
++			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealInsights" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealFrontend" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealPak" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="DsymExporter" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealEditorServices" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealAtoS" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
++			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Mac" Tag="#Build Tools Mac" UseSccache="$(bUseSccache)" Arguments="-EnableDSYM"/>
+ 		</Node>
+ 	</Agent>
+ 
+ 	<Agent Name="Tools Group LinuxNative" Type="Linux_Licensee">
+ 		<Node Name="Build Tools LinuxNative" Requires="Update Version Files">
+-			<Compile Target="CrashReportClient" Platform="Linux" Configuration="Shipping" Tag="#Build Tools LinuxNative" Arguments="$(CrashReporterCompileArgs)"/>
+-			<Compile Target="CrashReportClientEditor" Platform="Linux" Configuration="Shipping"  Tag="#Build Tools LinuxNative" Arguments="$(CrashReporterCompileArgs)"/>
+-			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealInsights" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealPak" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="SwitchboardListener" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="SwitchboardListenerHelper" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
+-			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative"/>
++			<Compile Target="CrashReportClient" Platform="Linux" Configuration="Shipping" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)" Arguments="$(CrashReporterCompileArgs)"/>
++			<Compile Target="CrashReportClientEditor" Platform="Linux" Configuration="Shipping"  Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)" Arguments="$(CrashReporterCompileArgs)"/>
++			<Compile Target="ShaderCompileWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="EpicWebHelper" Configuration="Shipping" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealInsights" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealLightmass" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="InterchangeWorker" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealPak" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealMultiUserServer" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealMultiUserSlateServer" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="BuildPatchTool" Configuration="Shipping" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealRecoverySvc" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="SwitchboardListener" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="SwitchboardListenerHelper" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
++			<Compile Target="UnrealObjectPtrTool" Configuration="Development" Platform="Linux" Tag="#Build Tools LinuxNative" UseSccache="$(bUseSccache)"/>
+ 		</Node>
+ 
+ 		<!-- Compile the C# tools. Copies files to a temporary directory first, to strip out all confidential folders and avoid sharing violations with the running version of UAT. -->
+@@ -908,7 +911,7 @@
+ 			<Do If="$(WithWin64) And $(CompileDatasmithPlugins) == 'True'">
+ 				<Property Name="DatasmithPlugins" Value="DatasmithCADImporter;DatasmithC4DImporter;AxFImporter;MDLImporter"/>
+ 				<ForEach Name="Plugin" Values="$(DatasmithPlugins)">
+-					<Compile Target="UnrealEditor" Configuration="Development" Platform="Win64" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/$(Plugin).uplugin&quot;"/>
++					<Compile Target="UnrealEditor" Configuration="Development" Platform="Win64" UseSccache="$(bUseSccache)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/$(Plugin).uplugin&quot;"/>
+ 					<Tag Files="$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/Binaries/Win64/..." With="#DatasmithPluginBinaries Win64"/>
+ 				</ForEach>
+ 			</Do>
+@@ -920,7 +923,7 @@
+ 			<Do If="$(WithMac) And $(CompileDatasmithPlugins) == 'True'">
+ 				<Property Name="DatasmithPlugins" Value="DatasmithCADImporter;DatasmithC4DImporter;AxFImporter;MDLImporter"/>
+ 				<ForEach Name="Plugin" Values="$(DatasmithPlugins)">
+-					<Compile Target="UnrealEditor" Configuration="Development" Platform="Mac" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/$(Plugin).uplugin&quot; $(MacArchitectureArg)"/>
++					<Compile Target="UnrealEditor" Configuration="Development" Platform="Mac" UseSccache="$(bUseSccache)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/$(Plugin).uplugin&quot; $(MacArchitectureArg)"/>
+ 					<Tag Files="$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/Binaries/Mac/..." With="#DatasmithPluginBinaries Mac"/>
+ 				</ForEach>
+ 			</Do>
+@@ -932,7 +935,7 @@
+ 			<Do If="$(WithLinux) And $(CompileDatasmithPlugins) == 'True'">
+ 				<Property Name="DatasmithPlugins" Value="DatasmithCADImporter;MDLImporter"/>
+ 				<ForEach Name="Plugin" Values="$(DatasmithPlugins)">
+-					<Compile Target="UnrealEditor" Configuration="Development" Platform="Linux" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/$(Plugin).uplugin&quot;"/>
++					<Compile Target="UnrealEditor" Configuration="Development" Platform="Linux" UseSccache="$(bUseSccache)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/$(Plugin).uplugin&quot;"/>
+ 					<Tag Files="$(RootDir)/Engine/Plugins/Enterprise/$(Plugin)/Binaries/Linux/..." With="#DatasmithPluginBinaries Linux"/>
+ 				</ForEach>
+ 			</Do>
+diff --git a/Engine/Plugins/Runtime/Database/SQLiteCore/Source/SQLiteCore/SQLiteCore.Build.cs b/Engine/Plugins/Runtime/Database/SQLiteCore/Source/SQLiteCore/SQLiteCore.Build.cs
+index cda20613fd..985d2bc1e4 100644
+--- a/Engine/Plugins/Runtime/Database/SQLiteCore/Source/SQLiteCore/SQLiteCore.Build.cs
++++ b/Engine/Plugins/Runtime/Database/SQLiteCore/Source/SQLiteCore/SQLiteCore.Build.cs
+@@ -16,6 +16,10 @@ namespace UnrealBuildTool.Rules
+ 				}
+ 			);
+ 
++			// AWE_CHANGES_BEGIN - Disable this warning, breaks CI with Sccache for some reason
++			bEnableUndefinedIdentifierWarnings = false;
++			// AWE_CHANGES_END
++
+ 			// Allow direct access to the SQLite API from outside this module
+ 			// Note: There are additional macros defined inside SQLiteEmbedded.c to allow this API export to work
+ 			PublicDefinitions.Add("SQLITE_API=SQLITECORE_API");
+diff --git a/Engine/Scripts/Programmer/BuildSccache.ps1 b/Engine/Scripts/Programmer/BuildSccache.ps1
+new file mode 100644
+index 0000000000..1119476b17
+--- /dev/null
++++ b/Engine/Scripts/Programmer/BuildSccache.ps1
+@@ -0,0 +1,49 @@
++# AWE_FILE_BEGIN - Erin
++# Builds a copy of sccache with the correct configration and places it inside "Engine/Binaries/Thirdpaty/Sccache/"
++# It exists in here because I'm not sure if I will upstream our custom sccache changes.
++#
++# Requirements:
++# - Rust. Sccache developers recommend getting it via RustUp (https://rustup.rs/)
++# - Read the building guide: https://github.com/AWildErin/sccache/tree/awe-changes?tab=readme-ov-file#build-requirements
++#
++# Setup:
++# 1. Clone https://github.com/awilderin/sccache and checkout "awe-changes"
++# 	 (Example: git clone -b awe-changes https://github.com/awilderin/sccache)
++# 2. Run this script
++#	 (Example: ./Engine/Scripts/Programmer/BuildSccache.ps1 -RepoPath "Path/To/My/Repo" )
++# 3. Remember to update which commit sccache was built from in Engine/Binaries/ThirdParty/Sccache/sccache.tps.
++
++param (
++	[string]$RepoPath,
++	[string]$Version = ""
++)
++
++$Target = "x86_64-pc-windows-msvc"
++$Root = $PSScriptRoot
++$SccacheDir = "$Root/../../Binaries/ThirdParty/Sccache"
++
++Write-Host "Building Sccache located at: $RepoPath"
++
++if (![System.IO.File]::Exists("$RepoPath/Cargo.toml")) {
++	Write-Error "Failed to find cargo.toml at $RepoPath!";
++	return
++}
++
++Write-Host "Found Cargo.toml"
++
++Write-Host "Building..."
++$CargoBuild = Start-Process -WorkingDirectory $RepoPath -FilePath "cargo" -ArgumentList "build --locked --release --bin sccache --target $Target --features=openssl/vendored" -NoNewWindow -PassThru -Wait -ErrorAction Stop
++
++if ($CargoBuild.ExitCode -ne 0) {
++	Write-Error "Failed to build sccache! Please check output!"
++	return
++}
++
++Write-Host "Compile successful"
++if ([System.IO.File]::Exists("$RepoPath/target/$target/release/sccache.exe")) {
++	Write-Host "Copying sccache.exe..."
++
++	Copy-Item -Path "$RepoPath/target/$target/release/sccache.exe" -Destination "$SccacheDir/sccache.exe"
++}
++
++Write-Host "Finished!"
+\ No newline at end of file
+diff --git a/Engine/Scripts/Programmer/deprecated_GetSccache.ps1 b/Engine/Scripts/Programmer/deprecated_GetSccache.ps1
+new file mode 100644
+index 0000000000..3cc2dbfcd7
+--- /dev/null
++++ b/Engine/Scripts/Programmer/deprecated_GetSccache.ps1
+@@ -0,0 +1,59 @@
++$ApiUrl = "https://api.github.com/repos/mozilla/sccache/releases/latest"
++# Relative to Engine/Scripts/Programmer
++$Root = $PSScriptRoot
++$SccacheDir = "$Root/../../BInaries/ThirdParty/Sccache"
++
++# Remove existing sccache exe if it exists
++if (Test-Path "$SccacheDir/sccache.exe") { Remove-Item -Force "$SccacheDir/sccache.exe" }
++
++try {
++	$Response = Invoke-WebRequest -Uri $ApiUrl -ErrorAction Stop
++} catch {
++	Write-Error "uh oh!"
++	return
++}
++
++$ApiJson = $Response.Content | ConvertFrom-Json
++$Tag = $ApiJson.tag_name
++if ([string]::IsNullOrEmpty($Tag)) {
++	Write-Error "Failed to get Sccahe tag_name from $ApiUrl!"
++	return
++}
++
++$FileName = "sccache-$Tag-x86_64-pc-windows-msvc.zip"
++foreach($Asset in $ApiJson.assets) {
++    if ($Asset.name -eq $FileName)
++    {
++        $FoundAssetUrl = $Asset.browser_download_url
++        break
++    }
++}
++
++if ([string]::IsNullOrEmpty($FoundAssetUrl))
++{
++    Write-Error "Failed to get asset url for $FileName!"
++	return
++}
++
++# Check if folder exiss, if not create it
++If(!(Test-Path -PathType Container $SccacheDir))
++{
++    # Create it silently
++    New-Item -Path $SccacheDir -ItemType Directory | Out-Null
++}
++
++# Sccache include a subfolder inside the zip, yay
++$FolderName = "sccache-$Tag-x86_64-pc-windows-msvc" 
++
++# Download and unzip file
++Invoke-WebRequest -Uri $FoundAssetUrl -OutFile "$SccacheDir/$FileName"
++Expand-Archive -Path "$SccacheDir/$FileName" -DestinationPath "$SccacheDir"
++
++# Move sccache.exe to correct location
++Move-Item -Path "$SccacheDir/$FolderName/sccache.exe" -Destination "$SccacheDir"
++
++# Clear files
++Remove-Item -Path "$SccacheDir/$FileName"
++Remove-Item -Path "$SccacheDir/$FolderName" -Recurse -Force -EA Continue 
++
++Write-Host $FoundAssetUrl
+\ No newline at end of file
+diff --git a/Engine/Source/Programs/AutomationTool/AutomationUtils/UnrealBuild.cs b/Engine/Source/Programs/AutomationTool/AutomationUtils/UnrealBuild.cs
+index 6998993d47..b3f6d74458 100644
+--- a/Engine/Source/Programs/AutomationTool/AutomationUtils/UnrealBuild.cs
++++ b/Engine/Source/Programs/AutomationTool/AutomationUtils/UnrealBuild.cs
+@@ -146,7 +146,7 @@ namespace AutomationTool
+ 			}
+ 		}
+ 
+-		void BuildWithUBT(List<BuildTarget> Targets, Dictionary<BuildTarget, BuildManifest> TargetToManifest, bool DisableXGE, bool AllCores)
++		void BuildWithUBT(List<BuildTarget> Targets, Dictionary<BuildTarget, BuildManifest> TargetToManifest, bool DisableXGE, bool AllCores, bool UseSccache = false)
+ 		{
+ 			List<FileReference> ManifestFiles = new List<FileReference>(Targets.Count);
+ 
+@@ -175,6 +175,10 @@ namespace AutomationTool
+ 			{
+ 				FullCommandLine.Append(" -AllCores");
+ 			}
++			if (UseSccache)
++			{
++				FullCommandLine.Append(" -UseSccache");
++			}
+ 
+ 			PrepareUBT();
+ 
+@@ -522,8 +526,9 @@ namespace AutomationTool
+ 		/// <param name="InUpdateVersionFiles">True if the version files are to be updated </param>
+ 		/// <param name="InForceNoXGE">If true will force XGE off</param>
+ 		/// <param name="InUseParallelExecutor">If true AND XGE not present or not being used then use ParallelExecutor</param>
++		/// <param name="InUseSccache">If true then use SccacheExecutor</param>
+ 		/// <param name="InAllCores">If true AND XGE not present or not being used then ensure UBT uses all available cores</param>
+-		public void Build(BuildAgenda Agenda, bool? InDeleteBuildProducts = null, bool InUpdateVersionFiles = true, bool InForceNoXGE = false, bool InUseParallelExecutor = false, bool InShowProgress = false, bool InAllCores = false, int? InChangelistNumberOverride = null, Dictionary<BuildTarget, BuildManifest> InTargetToManifest = null)
++		public void Build(BuildAgenda Agenda, bool? InDeleteBuildProducts = null, bool InUpdateVersionFiles = true, bool InForceNoXGE = false, bool InUseParallelExecutor = false, bool InUseSccache = false, bool InShowProgress = false, bool InAllCores = false, int? InChangelistNumberOverride = null, Dictionary<BuildTarget, BuildManifest> InTargetToManifest = null)
+ 		{
+ 			if (!CommandUtils.CmdEnv.HasCapabilityToCompile)
+ 			{
+@@ -577,6 +582,7 @@ namespace AutomationTool
+ 			Logger.LogDebug("************************* UnrealBuild:");
+ 			Logger.LogDebug("************************* UseXGE: {bCanUseXGE}", bCanUseXGE);
+ 			Logger.LogDebug("************************* UseParallelExecutor: {bCanUseParallelExecutor}", bCanUseParallelExecutor);
++			Logger.LogDebug("************************* UseSccache: {InUseSccache}", InUseSccache);
+ 
+ 			// Clean all the targets
+ 			foreach (BuildTarget Target in Agenda.Targets)
+@@ -603,7 +609,7 @@ namespace AutomationTool
+ 						if (ConfigTargets.Count > 0)
+ 						{
+ 							// Build all the targets
+-							BuildWithUBT(ConfigTargets, InTargetToManifest, bDisableXGE, InAllCores);
++							BuildWithUBT(ConfigTargets, InTargetToManifest, bDisableXGE, InAllCores, InUseSccache);
+ 						}
+ 					}
+ 				}
+@@ -617,7 +623,7 @@ namespace AutomationTool
+ 			}
+ 
+ 			// Build all the targets
+-			BuildWithUBT(Targets, InTargetToManifest, bDisableXGE, InAllCores);
++			BuildWithUBT(Targets, InTargetToManifest, bDisableXGE, InAllCores, InUseSccache);
+ 		}
+ 
+ 		/// <summary>
+diff --git a/Engine/Source/Programs/AutomationTool/BuildGraph/Tasks/CompileTask.cs b/Engine/Source/Programs/AutomationTool/BuildGraph/Tasks/CompileTask.cs
+index f576aa1c6c..e130c2d196 100644
+--- a/Engine/Source/Programs/AutomationTool/BuildGraph/Tasks/CompileTask.cs
++++ b/Engine/Source/Programs/AutomationTool/BuildGraph/Tasks/CompileTask.cs
+@@ -61,6 +61,12 @@ namespace AutomationTool.Tasks
+ 		[TaskParameter(Optional = true)]
+ 		public bool AllowParallelExecutor = true;
+ 
++		/// <summary>
++		/// Whether to use the sccache executor for this job.
++		/// </summary>
++		[TaskParameter(Optional = true)]
++		public bool UseSccache = false;
++
+ 		/// <summary>
+ 		/// Whether to allow UBT to use all available cores, when AllowXGE is disabled.
+ 		/// </summary>
+@@ -110,6 +116,11 @@ namespace AutomationTool.Tasks
+ 		/// </summary>
+ 		bool bAllowAllCores = false;
+ 
++		/// <summary>
++		/// Whether to use the sccache executor for this job.
++		/// </summary>
++		bool bUseSccache = false;
++
+ 		/// <summary>
+ 		/// Constructor
+ 		/// </summary>
+@@ -148,6 +159,7 @@ namespace AutomationTool.Tasks
+ 			bAllowXGE &= Parameters.AllowXGE;
+ 			bAllowParallelExecutor &= Parameters.AllowParallelExecutor;
+ 			bAllowAllCores &= Parameters.AllowAllCores;
++			bUseSccache = Parameters.UseSccache;
+ 
+ 			UnrealBuild.BuildTarget Target = new UnrealBuild.BuildTarget { TargetName = Parameters.Target, Platform = Parameters.Platform, Config = Parameters.Configuration, UprojectPath = CompileTask.FindProjectFile(), UBTArgs = (Parameters.Arguments ?? ""), Clean = Parameters.Clean };
+ 			if(!String.IsNullOrEmpty(Parameters.Tag))
+@@ -178,7 +190,7 @@ namespace AutomationTool.Tasks
+ 
+ 			bool bCanUseParallelExecutor = (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64 && bAllowParallelExecutor);	// parallel executor is only available on Windows as of 2016-09-22
+ 			bool bAllCores = (CommandUtils.IsBuildMachine || bAllowAllCores);	// Enable using all cores if this is a build agent or the flag was passed in to the task and XGE is disabled.
+-			Builder.Build(Agenda, InDeleteBuildProducts: null, InUpdateVersionFiles: false, InForceNoXGE: !bAllowXGE, InUseParallelExecutor: bCanUseParallelExecutor, InAllCores: bAllCores, InTargetToManifest: TargetToManifest);
++			Builder.Build(Agenda, InDeleteBuildProducts: null, InUpdateVersionFiles: false, InForceNoXGE: !bAllowXGE, InUseParallelExecutor: bCanUseParallelExecutor, InUseSccache: bUseSccache, InAllCores: bAllCores, InTargetToManifest: TargetToManifest);
+ 
+ 			UnrealBuild.CheckBuildProducts(Builder.BuildProductFiles);
+ 
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Configuration/BuildConfiguration.cs b/Engine/Source/Programs/UnrealBuildTool/Configuration/BuildConfiguration.cs
+index 50c519a9d1..eb71eb2b37 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/Configuration/BuildConfiguration.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/Configuration/BuildConfiguration.cs
+@@ -69,6 +69,15 @@ namespace UnrealBuildTool
+ 		[CommandLine("-NoSNDBS", Value = "false")]
+ 		public bool bAllowSNDBS = true;
+ 
++		/// AWE_CHANGES_BEGIN - Sccache
++		/// <summary>
++		/// Whether sccache may be used.
++		/// </summary>
++		[XmlConfigFile]
++		[CommandLine("-UseSccache", Value = "true")]
++		public bool bUseSccache = false;
++		/// AWE_CHANGES_END
++
+ 		/// <summary>
+ 		/// Enables support for very fast iterative builds by caching target data. Turning this on causes Unreal Build Tool to emit
+ 		/// 'UBT Makefiles' for targets when they are built the first time. Subsequent builds will load these Makefiles and begin
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Executors/ParallelExecutor.cs b/Engine/Source/Programs/UnrealBuildTool/Executors/ParallelExecutor.cs
+index e2fc0bd666..716574f20c 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/Executors/ParallelExecutor.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/Executors/ParallelExecutor.cs
+@@ -104,7 +104,9 @@ namespace UnrealBuildTool
+ 		/// </summary>
+ 		public int NumParallelProcesses { get; private set; }
+ 
+-		private static readonly char[] LineEndingSplit = new char[] { '\n', '\r' };
++		// AWE_CHANGES_BEGIN - Turned into protected as we use it in Sccache
++		protected static readonly char[] LineEndingSplit = new char[] { '\n', '\r' };
++		// AWE_CHANGES_END
+ 
+ 		public static int GetDefaultNumParallelProcesses(int MaxLocalActions, bool bAllCores, ILogger Logger)
+ 		{
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Executors/Sccache.cs b/Engine/Source/Programs/UnrealBuildTool/Executors/Sccache.cs
+new file mode 100644
+index 0000000000..38b405737e
+--- /dev/null
++++ b/Engine/Source/Programs/UnrealBuildTool/Executors/Sccache.cs
+@@ -0,0 +1,160 @@
++// AWE_FILE_BEGIN
++// Erin - Adds Sccache support around parallel actions.
++// It's largely copied code from the parallel executor because I can't find a good way to do this.
++
++using EpicGames.Core;
++using Microsoft.Extensions.Logging;
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Threading;
++using System.Threading.Tasks;
++using UnrealBuildBase;
++using UnrealBuildTool.Artifacts;
++
++namespace UnrealBuildTool
++{
++	/// <summary>
++	/// Wrapper around parallel executor that calls sccache
++	/// </summary>
++	/// @todo Make the way we get the exectuable better..
++	sealed class Sccache : ParallelExecutor
++	{
++		private static string? SccacheExecutablePath;
++
++		// Which executables can sccache *not* cache.
++		private static List<string> InvalidCommands = new List<string>()
++		{
++			"rc",	// Resource Files
++			"ispc",	// Intel
++			"cmd"	// Some steps call a batch file that compiles type libraries. Only 2 instances i've seen are: ADOSupport, VisualStudioDTE
++		};
++
++		public Sccache(int MaxLocalActions, bool bAllCores, bool bCompactOutput, ILogger Logger) : base(MaxLocalActions, bAllCores, bCompactOutput, Logger)
++		{
++			// Either uncomment this or set the env var on your machine to enable logging for sccache.
++			// Valid values are: error, warn, info, debug, trace
++			//Environment.SetEnvironmentVariable("SCCACHE_LOG", "debug");
++			//Environment.SetEnvironmentVariable("SCCACHE_ERROR_LOG", Path.Combine(Unreal.EngineDirectory.ToString(), "SccacheErrLog.log"));
++		}
++
++		public override string Name => "Sccache";
++
++		public override async Task<bool> ExecuteActionsAsync(IEnumerable<LinkedAction> ActionsToExecute, ILogger Logger, IActionArtifactCache? actionArtifactCache)
++		{
++			if (!ActionsToExecute.Any())
++			{
++				return true;
++			}
++
++			Logger.LogInformation($"Building {ActionsToExecute.Count()} actions with sccache.");
++
++			// The "useAutomaticQueue" should always be true unless manual queue is being tested
++			bool useAutomaticQueue = true;
++			if (useAutomaticQueue)
++			{
++				using ImmediateActionQueue queue = CreateActionQueue(ActionsToExecute, actionArtifactCache, Logger);
++				int actionLimit = Math.Min(NumParallelProcesses, queue.TotalActions);
++				queue.CreateAutomaticRunner(action => RunSccacheAction(queue, action), bUseActionWeights, actionLimit, actionLimit);
++				queue.Start();
++				queue.StartManyActions();
++				return await queue.RunTillDone();
++			}
++			else
++			{
++				using ImmediateActionQueue queue = CreateActionQueue(ActionsToExecute, actionArtifactCache, Logger);
++				int actionLimit = Math.Min(NumParallelProcesses, queue.TotalActions);
++				ImmediateActionQueueRunner runner = queue.CreateManualRunner(action => RunSccacheAction(queue, action), bUseActionWeights, actionLimit, actionLimit);
++				queue.Start();
++				using Timer timer = new((_) => queue.StartManyActions(runner), null, 0, 500);
++				queue.StartManyActions();
++				return await queue.RunTillDone();
++			}
++		}
++
++		private static Func<Task>? RunSccacheAction(ImmediateActionQueue queue, LinkedAction action)
++		{
++			return async () =>
++			{
++				ExecuteResults results = await RunSccacheAction(action, queue.ProcessGroup, queue.CancellationToken);
++				queue.OnActionCompleted(action, results.ExitCode == 0, results);
++			};
++		}
++
++		private static async Task<ExecuteResults> RunSccacheAction(LinkedAction Action, ManagedProcessGroup ProcessGroup, CancellationToken CancellationToken, string? AdditionalDescription = null)
++		{
++			CancellationToken.ThrowIfCancellationRequested();
++
++			string Command = Action.CommandPath.FullName;
++			string Arguments = Action.CommandArguments;
++
++			// If we're a compile type, forward it through sccache
++			string? SccacheExecutable = GetExecutablePath();
++			if (Action.ActionType == ActionType.Compile && SccacheExecutable != null && !InvalidCommands.Contains(Path.GetFileNameWithoutExtension(Command)))
++			{
++				Arguments = $"\"{Command}\" {Arguments}";
++				Command = SccacheExecutable;
++			}
++
++			using ManagedProcess Process = new ManagedProcess(ProcessGroup, Command, Arguments, Action.WorkingDirectory.FullName, null, null, ProcessPriority);
++
++			using MemoryStream StdOutStream = new MemoryStream();
++			await Process.CopyToAsync(StdOutStream, CancellationToken);
++
++			CancellationToken.ThrowIfCancellationRequested();
++
++			Process.WaitForExit();
++
++			List<string> LogLines = Console.OutputEncoding.GetString(StdOutStream.GetBuffer(), 0, Convert.ToInt32(StdOutStream.Length)).Split(LineEndingSplit, StringSplitOptions.RemoveEmptyEntries).ToList();
++			int ExitCode = Process.ExitCode;
++			TimeSpan ProcessorTime = Process.TotalProcessorTime;
++			TimeSpan ExecutionTime = Process.ExitTime - Process.StartTime;
++			return new ExecuteResults(LogLines, ExitCode, ExecutionTime, ProcessorTime, AdditionalDescription);
++		}
++
++		public static string GetExecutablePath()
++		{
++			if (string.IsNullOrEmpty(SccacheExecutablePath))
++			{
++				SccacheExecutablePath = Path.Combine(Unreal.EngineDirectory.ToString(), "Binaries", "ThirdParty", "Sccache");
++			
++				if (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64)
++				{
++					SccacheExecutablePath = Path.Combine(SccacheExecutablePath, "sccache.exe");
++				}
++			}
++			return SccacheExecutablePath;
++		}
++
++		private static bool IsSupportedPlatform()
++		{
++			if (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64)
++			{
++				return true;
++			}
++
++			return false;
++		}
++
++		public static bool IsAvailable(ILogger Logger)
++		{
++			if (!IsSupportedPlatform())
++			{
++				return false;
++			}
++
++			string ExecutablePath = GetExecutablePath();
++			if (File.Exists(ExecutablePath))
++			{
++				SccacheExecutablePath = ExecutablePath;
++				return true;
++			}
++
++			Logger.LogError("Failed to find executable for Sccache! Build will continue, but no cached objects will be used.");
++			return false;
++		}
++	}
++}
+diff --git a/Engine/Source/Programs/UnrealBuildTool/System/ActionGraph.cs b/Engine/Source/Programs/UnrealBuildTool/System/ActionGraph.cs
+index d2960e7046..2b7dd655a9 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/System/ActionGraph.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/System/ActionGraph.cs
+@@ -387,6 +387,12 @@ namespace UnrealBuildTool
+ 				{
+ 					return new FASTBuild(BuildConfiguration.MaxParallelActions, BuildConfiguration.bAllCores, BuildConfiguration.bCompactOutput, Logger);
+ 				}
++				// AWE_CHANGES_BEGIN - Sccache
++				else if (BuildConfiguration.bUseSccache && Sccache.IsAvailable(Logger))
++				{
++					return new Sccache(BuildConfiguration.MaxParallelActions, BuildConfiguration.bAllCores, BuildConfiguration.bCompactOutput, Logger);
++				}
++				// AWE_CHANGES_END
+ 			}
+ 
+ 			return new ParallelExecutor(BuildConfiguration.MaxParallelActions, BuildConfiguration.bAllCores, BuildConfiguration.bCompactOutput, Logger);
+-- 
+2.47.1.windows.2
+
