@@ -1,0 +1,11 @@
+# IDEs
+.idea
+.vscode
+.vs
+.run
+
+__pycache__
+.env
+
+# ignore log dir
+.ciscripts

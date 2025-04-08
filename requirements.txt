@@ -1,0 +1,5 @@
+# Mainly used to handle sorting semvars for GitLab packages
+semver
+
+# Used for contacting SteamAPI
+requests
