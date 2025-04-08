@@ -1,0 +1,27 @@
+default:
+  tags:
+    - erin
+    - ue_awebuild
+
+  interruptible: true
+
+stages:
+  - trigger
+
+trigger-test:
+  stage: trigger
+  trigger:
+    include: ".gitlab/ci/.test.gitlab-ci.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "Test"
+
+trigger-release:
+  stage: trigger
+  trigger:
+    include: ".gitlab/ci/.release.gitlab-ci.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "Release"

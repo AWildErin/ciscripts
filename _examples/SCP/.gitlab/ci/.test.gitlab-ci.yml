@@ -1,0 +1,22 @@
+default:
+  tags:
+    - erin
+    - ue_awebuild
+
+  interruptible: true
+  image: awilderin/unreal:latest
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_DEPTH: 1
+  GIT_SUBMODULE_FORCE_HTTPS : "true"
+
+stages:
+  - test
+
+test_win64:
+  stage: test
+
+  script:
+    - py ./Scripts/CI/gen_build_info.py
+    - py ./Scripts/CI/test_win64.py
