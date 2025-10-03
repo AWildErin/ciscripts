@@ -41,3 +41,4 @@ class BuildCookRunArguments:
     pak: bool = False
     stage: bool = False
     stagingdirectory: str = None
+    mapinisectionstocook: str = None
