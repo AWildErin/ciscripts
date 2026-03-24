@@ -54,6 +54,7 @@ def ci_project_url() -> str:
     var = os.getenv('ci_project_url', '')
     return var
 
+
 @lru_cache
 def ci_commit_branch() -> str:
     """
@@ -149,4 +150,22 @@ def ci_job_url() -> str:
     Valid for: GitLab
     """
     var = os.getenv('ci_job_url', '')
+    return var
+
+
+def ci_runner_description() -> str:
+    """
+    Returns the runner description for the current CI job.
+    Valid for: GitLab
+    """
+    var = os.getenv('ci_runner_description', '')
+    return var
+
+
+def ci_runner_id() -> str:
+    """
+    Returns the runner id for the current CI job.
+    Valid for: GitLab
+    """
+    var = os.getenv('ci_runner_id', '')
     return var

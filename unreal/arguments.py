@@ -42,3 +42,4 @@ class BuildCookRunArguments:
     stage: bool = False
     stagingdirectory: str = None
     mapinisectionstocook: str = None
+    nocodesign: bool = False

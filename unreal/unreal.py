@@ -5,7 +5,6 @@ import sys
 # Locks to windows for now, eventually we should scope to allow this to work on non windows platforms
 import winreg
 
-
 from ..utility import *
 from .uat import UAT
 from .editor import Editor
@@ -26,6 +25,24 @@ class Unreal:
         self.minor = 0
         self.version = ''
         self.is_source_build = False
+
+    @classmethod
+    def source_build(cls, path: str) -> 'Unreal':
+        """
+        Uses the Unreal installation located at the given path
+        @param path:    Root path of the entire Unreal install
+        """
+
+        ue = Unreal()
+        ue.is_source_build = True
+
+        ue._set_path(path)
+
+        # Setup objects
+        ue._uat = UAT(ue)
+        ue._editor = Editor(ue)
+
+        return ue
 
     @classmethod
     def egs_build(cls, major: int, minor: int) -> 'Unreal':
@@ -69,6 +86,27 @@ class Unreal:
         ue._editor = Editor(ue)
 
         return ue
+
+    def _set_path(self, path: str):
+        self.logger.info(f'Setting UE path to {path}')
+
+        # Validate this is a correct path, not a perfect solution but it's fine
+        files_to_test = [
+            'Engine/Build/BatchFiles/RunUAT.bat',
+            'Engine/Build/BatchFiles/RunUBT.bat'
+        ]
+
+        self.unreal_path = path.replace(os.sep, '/')
+        self.binaries_path = f'{path}/Engine/Binaries/Win64'
+        self.batch_path = f'{path}/Engine/Build/BatchFiles'
+
+        self.logger.debug('Checking if path is valid...')
+        for x in files_to_test:
+            if not os.path.exists(os.path.join(path, x)):
+                self.logger.fatal(f'Failed to find {x} inside path: "{path}"')
+                sys.exit(1)
+
+        self.logger.debug('UE path is valid!')
 
     def _find_install(self):
         self.logger.info(f'Looking for UE {self.version}')

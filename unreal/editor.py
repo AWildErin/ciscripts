@@ -14,6 +14,7 @@ class Editor:
     logger = register_logger('editor')
 
     def __init__(self, unreal: 'Unreal'):
+        self.logger.debug('Initialising Editor')
         self._unreal = unreal
 
     def exec_cmd(self, project: str, args: list, nullrhi: bool = True) -> (int, str, str):

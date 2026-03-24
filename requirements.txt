@@ -3,3 +3,5 @@ semver
 
 # Used for contacting SteamAPI
 requests
+
+p4python

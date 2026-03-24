@@ -5,6 +5,8 @@ from pathlib import Path
 
 _custom_log_dir: str = ""
 _ciscripts_root_dir = os.path.abspath(os.path.dirname(os.path.realpath(__file__)) + "/../")
+
+
 def get_process_log_dir():
     """
     Gets the log dir for process logs.

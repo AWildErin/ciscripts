@@ -8,6 +8,7 @@ from .arguments import *
 
 # To work around circular imports
 from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from .unreal import Unreal
 
@@ -55,7 +56,7 @@ class UAT:
         # If we don't have any args, print the help instead
         if len(args) == 0:
             cmd.append('-List')
-        else: # can't use unattended with list
+        else:  # can't use unattended with list
             cmd.append('-unattended')
 
         self.logger.debug(f'Executing UAT with {cmd}')
@@ -119,4 +120,23 @@ class UAT:
         if clean is True:
             cmd.append('-clean')
 
+        return self.exec(cmd)
+
+    ###############
+    # BUILD GRAPH #
+    ###############
+    def exec_buildgraph(self, script: str, target: str, args: list[str]) -> (int, str, str):
+        """
+        Executes a buildgraph script
+        :param script:  Script path relative to the workspace root
+        :param target:  Which target to run
+        :param args:    Additional arguments to pass to the build graph
+        """
+
+        cmd = [
+            'BuildGraph',
+            f'-script={script}',
+            f'-target={target}',
+        ]
+        cmd.extend(args)
         return self.exec(cmd)
