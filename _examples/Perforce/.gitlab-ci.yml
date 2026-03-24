@@ -1,0 +1,46 @@
+default:
+  interruptible: true
+
+stages:
+  - trigger
+
+#
+# Add your triggers here, these are what will call the actual pipelines
+#
+
+trigger-ugs-build:
+  stage: trigger
+  trigger:
+    include: "Scripts/UGS-Build.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "UGS-Build"
+
+
+trigger-scp-buildeditor:
+  stage: trigger
+  trigger:
+    include: "Scripts/SCP-BuildEditor.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "SCP-BuildEditor"
+
+trigger-scp-test:
+  stage: trigger
+  trigger:
+    include: "Scripts/SCP-Test.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "SCP-Test"
+
+trigger-scp-releasesteam:
+  stage: trigger
+  trigger:
+    include: "Scripts/SCP-ReleaseSteam.yml"
+    forward:
+      pipeline_variables: true
+  rules:
+    - if: $MANUAL_PIPELINE == "SCP-ReleaseSteam"

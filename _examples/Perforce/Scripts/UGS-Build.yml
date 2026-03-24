@@ -1,0 +1,27 @@
+stages:
+  - build
+
+UGS-Build:
+  tags:
+    - windows
+    - unreal
+    - erin
+
+  image: awilderin/unreal:latest
+  stage: build
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: 1
+    GIT_SUBMODULE_FORCE_HTTPS : "true"
+    IsBuildMachine: 1
+
+  artifacts:
+    when: on_failure
+    expire_in: "1 week"
+    paths:
+      - "Engine/Programs/AutomationTool/Saved/Logs/*.txt"
+
+  script:
+    - pip install -r ./Scripts/ciscripts/requirements.txt
+    - py ./Scripts/UGS-Build.py

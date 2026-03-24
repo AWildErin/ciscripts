@@ -1,0 +1,54 @@
+stages:
+  - test
+  - release
+
+SCP-Test:
+  tags:
+    - windows
+    - unreal
+    - erin
+
+  image: awilderin/unreal:latest
+  stage: test
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: 1
+    GIT_SUBMODULE_FORCE_HTTPS : "true"
+    IsBuildMachine: 1
+
+  artifacts:
+    when: on_failure
+    expire_in: "1 week"
+    paths:
+      - "Engine/Programs/AutomationTool/Saved/Logs/*.txt"
+
+  script:
+    - pip install -r ./Scripts/ciscripts/requirements.txt
+    - py ./Scripts/SCP-Test.py
+
+SCP-ReleaseSteam:
+  tags:
+    - windows
+    - unreal
+    - erin
+
+  image: awilderin/unreal:latest
+  stage: release
+  needs: ["SCP-Test"]
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: 1
+    GIT_SUBMODULE_FORCE_HTTPS : "true"
+    IsBuildMachine: 1
+
+  artifacts:
+    when: on_failure
+    expire_in: "1 week"
+    paths:
+      - "Engine/Programs/AutomationTool/Saved/Logs/*.txt"
+
+  script:
+    - pip install -r ./Scripts/ciscripts/requirements.txt
+    - py ./Scripts/SCP-ReleaseSteam.py
